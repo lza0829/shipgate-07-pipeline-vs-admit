@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS releases (
     CHECK(status IN ('待入闸','已入闸','晋升中','已放行','回滚中','已回滚','已关闭')),
   pipeline_status TEXT NOT NULL DEFAULT '未回执'
     CHECK(pipeline_status IN ('未回执','绿','红')),
+  gate_verdict TEXT
+    CHECK(gate_verdict IS NULL OR gate_verdict IN ('绿入闸','红入闸')),
+  gate_pipeline_status TEXT NOT NULL DEFAULT '未回执',
+  gate_alarm INTEGER NOT NULL DEFAULT 0,
   current_env_id INTEGER,
   canary_ratio INTEGER NOT NULL DEFAULT 10,
   note TEXT NOT NULL DEFAULT '',
@@ -44,6 +48,20 @@ CREATE TABLE IF NOT EXISTS releases (
   rolled_back_at TEXT,
   FOREIGN KEY(app_id) REFERENCES apps(id),
   FOREIGN KEY(current_env_id) REFERENCES environments(id)
+);
+CREATE TABLE IF NOT EXISTS artifact_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  release_id INTEGER NOT NULL,
+  artifact_digest TEXT NOT NULL DEFAULT '',
+  pipeline_status TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK(verdict IN ('绿入闸','红入闸')),
+  link_state TEXT NOT NULL DEFAULT '挂接成功'
+    CHECK(link_state IN ('挂接中','挂接成功','已收回')),
+  alarm INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  reclaimed_at TEXT,
+  FOREIGN KEY(release_id) REFERENCES releases(id)
 );
 CREATE TABLE IF NOT EXISTS promote_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,9 +125,13 @@ WINDOW_STATUSES = ("窗开", "窗关")
 
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    # 并发红绿翻转 / 入闸竞争时排队等写锁，而不是立刻 database is locked
+    conn.execute("PRAGMA busy_timeout=5000")
+    # 容器/挂载盘 fsync 较慢，NORMAL 在应用崩溃时仍安全，仅极端断电有代价
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -126,9 +148,25 @@ def db():
         conn.close()
 
 
+# 旧库平滑补列（CREATE TABLE IF NOT EXISTS 不会给已存在的 releases 加列）
+_RELEASE_ADDED_COLUMNS = {
+    "gate_verdict": "TEXT",
+    "gate_pipeline_status": "TEXT NOT NULL DEFAULT '未回执'",
+    "gate_alarm": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(releases)").fetchall()}
+    for name, ddl in _RELEASE_ADDED_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE releases ADD COLUMN {name} {ddl}")
+
+
 def init_db() -> None:
     with db() as conn:
         conn.executescript(SCHEMA)
+        migrate(conn)
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:

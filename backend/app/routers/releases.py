@@ -9,7 +9,15 @@ from app.services.common import (
     get_release,
     get_setting,
     next_serial,
-    now_str,
+)
+from app.services.gate import (
+    GateRejected,
+    admit_release,
+    enrich_release,
+    enrich_releases,
+    evaluate_gate,
+    reclaim_dirty_links,
+    record_pipeline,
 )
 
 router = APIRouter(tags=["发版单"])
@@ -27,16 +35,68 @@ class PipelineIn(BaseModel):
     流水线: str
 
 
+class ReclaimIn(BaseModel):
+    挂接编号: int | None = None
+
+
 @router.get("/发版单")
 def list_releases():
     with db() as conn:
-        return rows_to_list(conn.execute(RELEASE_SELECT + " ORDER BY r.id DESC").fetchall())
+        rows = conn.execute(RELEASE_SELECT + " ORDER BY r.id DESC").fetchall()
+        return enrich_releases(conn, rows)
 
 
 @router.get("/发版单/{release_id}")
 def one_release(release_id: int):
     with db() as conn:
-        return row_to_dict(get_release(conn, release_id))
+        return enrich_release(conn, get_release(conn, release_id))
+
+
+@router.get("/发版单/{release_id}/入闸判定")
+def gate_decision(release_id: int):
+    """读侧可重放：只根据库内持久事实推导能不能入闸、将形成什么裁决。"""
+    with db() as conn:
+        r = conn.execute("SELECT * FROM releases WHERE id=?", (release_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "发版单不存在")
+        return evaluate_gate(conn, r)
+
+
+@router.get("/制品挂接")
+def all_links(仅有效: bool = False):
+    sql = """
+        SELECT l.*, r.serial AS 发版单号
+          FROM artifact_links l
+          JOIN releases r ON r.id = l.release_id
+    """
+    if 仅有效:
+        sql += " WHERE l.link_state!='已收回'"
+    sql += " ORDER BY l.id DESC LIMIT 500"
+    with db() as conn:
+        return rows_to_list(conn.execute(sql).fetchall())
+
+
+@router.get("/发版单/{release_id}/挂接行")
+def release_links(release_id: int, 全部: bool = False):
+    with db() as conn:
+        r = conn.execute("SELECT id FROM releases WHERE id=?", (release_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "发版单不存在")
+        if 全部:
+            rows = conn.execute(
+                "SELECT * FROM artifact_links WHERE release_id=? ORDER BY id DESC",
+                (release_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM artifact_links
+                WHERE release_id=? AND link_state!='已收回'
+                ORDER BY id DESC
+                """,
+                (release_id,),
+            ).fetchall()
+        return rows_to_list(rows)
 
 
 @router.post("/发版单")
@@ -49,6 +109,8 @@ def create_release(body: ReleaseIn):
         if ratio < 0 or ratio > 100:
             raise HTTPException(400, "金丝雀比例须在 0 到 100")
         serial = next_serial(conn)
+        from app.services.common import now_str
+
         now = now_str()
         cur = conn.execute(
             """
@@ -61,55 +123,25 @@ def create_release(body: ReleaseIn):
         )
         rid = cur.lastrowid
         audit(conn, "发版单", rid, "申请发版", serial)
-        return row_to_dict(get_release(conn, rid))
+        return enrich_release(conn, get_release(conn, rid))
 
 
 @router.post("/发版单/{release_id}/入闸")
 def admit(release_id: int):
-    with db() as conn:
-        r = conn.execute("SELECT * FROM releases WHERE id=?", (release_id,)).fetchone()
-        if not r:
-            raise HTTPException(404, "发版单不存在")
-        if r["status"] != "待入闸":
-            raise HTTPException(400, "仅待入闸可入闸")
-        assert_app_enabled(conn, r["app_id"])
-        must_green = get_setting(conn, "入闸须流水线绿", "是") == "是"
-        if must_green and r["pipeline_status"] != "绿":
-            raise HTTPException(400, "流水线未绿，禁止入闸")
-        if not r["artifact_digest"]:
-            raise HTTPException(400, "缺少制品摘要，禁止入闸")
-        active = conn.execute(
-            """
-            SELECT id FROM releases
-            WHERE app_id=? AND id!=? AND status IN ('已入闸','晋升中','已放行','回滚中')
-            """,
-            (r["app_id"], release_id),
-        ).fetchone()
-        if active:
-            raise HTTPException(400, "同应用已有在途发版单，禁止并行入闸")
-        test = conn.execute("SELECT id FROM environments WHERE code='测'").fetchone()
-        now = now_str()
-        conn.execute(
-            """
-            UPDATE releases SET status='已入闸', admitted_at=?, current_env_id=? WHERE id=?
-            """,
-            (now, test["id"], release_id),
-        )
-        audit(conn, "发版单", release_id, "入闸", r["serial"])
-        return row_to_dict(get_release(conn, release_id))
+    try:
+        return admit_release(release_id)
+    except GateRejected as gr:
+        raise HTTPException(status_code=gr.status_code, detail=gr.message)
+
+
+@router.post("/发版单/{release_id}/收回挂接")
+def reclaim_link(release_id: int, body: ReclaimIn | None = None):
+    link_id = body.挂接编号 if body else None
+    return reclaim_dirty_links(release_id, link_id)
 
 
 @router.post("/发版单/{release_id}/流水线")
 def set_pipeline(release_id: int, body: PipelineIn):
     if body.流水线 not in ("未回执", "绿", "红"):
         raise HTTPException(400, "流水线状态非法")
-    with db() as conn:
-        r = conn.execute("SELECT * FROM releases WHERE id=?", (release_id,)).fetchone()
-        if not r:
-            raise HTTPException(404, "发版单不存在")
-        conn.execute(
-            "UPDATE releases SET pipeline_status=? WHERE id=?",
-            (body.流水线, release_id),
-        )
-        audit(conn, "发版单", release_id, "流水线回执", body.流水线)
-        return row_to_dict(get_release(conn, release_id))
+    return record_pipeline(release_id, body.流水线)

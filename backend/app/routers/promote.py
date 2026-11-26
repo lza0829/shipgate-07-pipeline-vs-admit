@@ -13,6 +13,7 @@ from app.services.common import (
     set_app_env_version,
     upsert_instance,
 )
+from app.services.gate import enrich_release, promotion_block_reason
 
 router = APIRouter(tags=["晋升"])
 
@@ -28,8 +29,10 @@ def promote(release_id: int, body: PromoteIn):
         r = conn.execute("SELECT * FROM releases WHERE id=?", (release_id,)).fetchone()
         if not r:
             raise HTTPException(404, "发版单不存在")
-        if r["status"] not in ("已入闸", "晋升中"):
-            raise HTTPException(400, "当前状态不可晋升")
+        # 晋升入口与入闸裁决同一口径：红入闸不得按绿通过
+        block = promotion_block_reason(r)
+        if block:
+            raise HTTPException(400, block)
         to_env = env_by_code(conn, body.目标环境)
         envs = ordered_envs(conn)
         codes = [e["code"] for e in envs]
@@ -76,4 +79,4 @@ def promote(release_id: int, body: PromoteIn):
         set_app_env_version(conn, r["app_id"], to_env["id"], r["target_version"])
         upsert_instance(conn, r["app_id"], to_env["id"], r["target_version"], "探针绿", release_id)
         audit(conn, "晋升", release_id, f"晋升到{body.目标环境}", body.备注)
-        return row_to_dict(get_release(conn, release_id))
+        return enrich_release(conn, get_release(conn, release_id))

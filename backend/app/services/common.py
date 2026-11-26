@@ -46,6 +46,30 @@ SELECT r.id AS 编号,
        r.artifact_digest AS 制品摘要,
        r.status AS 状态,
        r.pipeline_status AS 流水线,
+       r.gate_verdict AS 入闸结论,
+       r.gate_pipeline_status AS 入闸时流水线,
+       r.gate_alarm AS 入闸告警标记,
+       (SELECT l.id FROM artifact_links l
+          WHERE l.release_id = r.id AND l.link_state != '已收回'
+          ORDER BY l.id DESC LIMIT 1) AS 挂接编号,
+       (SELECT l.link_state FROM artifact_links l
+          WHERE l.release_id = r.id AND l.link_state != '已收回'
+          ORDER BY l.id DESC LIMIT 1) AS 挂接状态,
+       (SELECT l.verdict FROM artifact_links l
+          WHERE l.release_id = r.id AND l.link_state != '已收回'
+          ORDER BY l.id DESC LIMIT 1) AS 挂接结论,
+       (SELECT l.alarm FROM artifact_links l
+          WHERE l.release_id = r.id AND l.link_state != '已收回'
+          ORDER BY l.id DESC LIMIT 1) AS 挂接告警标记,
+       (SELECT l.artifact_digest FROM artifact_links l
+          WHERE l.release_id = r.id AND l.link_state != '已收回'
+          ORDER BY l.id DESC LIMIT 1) AS 挂接制品,
+       (SELECT l.note FROM artifact_links l
+          WHERE l.release_id = r.id AND l.link_state != '已收回'
+          ORDER BY l.id DESC LIMIT 1) AS 挂接备注,
+       (SELECT l.created_at FROM artifact_links l
+          WHERE l.release_id = r.id AND l.link_state != '已收回'
+          ORDER BY l.id DESC LIMIT 1) AS 挂接时间,
        r.current_env_id AS 当前环境编号,
        e.code AS 当前环境,
        e.name AS 当前环境名,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from fastapi import APIRouter
 from app.db import db, rows_to_list
+from app.services.gate import gate_consistency
 
 router = APIRouter(tags=["对账"])
 
@@ -22,6 +23,28 @@ def reconcile():
                 WHERE status IN ('已入闸','晋升中','已放行','回滚中')
                 """
             ).fetchone()["c"],
+            # 红入闸不得混作绿通过：两种口径分列
+            "绿入闸在途": conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM releases
+                WHERE gate_verdict='绿入闸'
+                  AND status IN ('已入闸','晋升中','已放行','回滚中')
+                """
+            ).fetchone()["c"],
+            "红入闸在途": conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM releases
+                WHERE gate_verdict='红入闸'
+                  AND status IN ('已入闸','晋升中','已放行','回滚中')
+                """
+            ).fetchone()["c"],
+            "按绿通过口径在途": conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM releases
+                WHERE gate_verdict='绿入闸'
+                  AND status IN ('已入闸','晋升中','已放行','回滚中')
+                """
+            ).fetchone()["c"],
         }
         version_vs_instance = rows_to_list(
             conn.execute(
@@ -40,8 +63,24 @@ def reconcile():
             ).fetchall()
         )
         promote_count = conn.execute("SELECT COUNT(*) AS c FROM promote_events").fetchone()["c"]
+        consistency = gate_consistency(conn)
+        dirty_links = rows_to_list(
+            conn.execute(
+                """
+                SELECT l.id AS 挂接编号, l.release_id AS 发版单编号, r.serial AS 发版单号,
+                       l.link_state AS 挂接状态, l.verdict AS 挂接结论, l.alarm AS 告警,
+                       l.created_at AS 时间
+                  FROM artifact_links l
+                  JOIN releases r ON r.id = l.release_id
+                 WHERE l.link_state != '已收回'
+                 ORDER BY l.id DESC
+                """
+            ).fetchall()
+        )
         return {
             "发版统计": release_stats,
             "晋升事件数": promote_count,
             "名册与实例": version_vs_instance,
+            "入闸一致性": consistency,
+            "挂接行": dirty_links,
         }

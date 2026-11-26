@@ -1,7 +1,8 @@
 from __future__ import annotations
 from fastapi import APIRouter
-from app.db import db, rows_to_list, row_to_dict
+from app.db import db, rows_to_list
 from app.services.common import RELEASE_SELECT
+from app.services.gate import enrich_releases, gate_consistency
 
 router = APIRouter(tags=["总览"])
 
@@ -14,12 +15,13 @@ def overview():
             counts[name] = conn.execute(
                 "SELECT COUNT(*) AS c FROM releases WHERE status=?", (name,)
             ).fetchone()["c"]
-        active = rows_to_list(
-            conn.execute(
-                RELEASE_SELECT
-                + " WHERE r.status IN ('已入闸','晋升中','已放行','回滚中') ORDER BY r.id DESC"
-            ).fetchall()
-        )
+        active_rows = conn.execute(
+            RELEASE_SELECT
+            + " WHERE r.status IN ('已入闸','晋升中','已放行','回滚中') ORDER BY r.id DESC"
+        ).fetchall()
+        # 在途行与发版单/挂接行/裁决同一装配口径
+        active = enrich_releases(conn, active_rows)
+        consistency = gate_consistency(conn)
         versions = rows_to_list(
             conn.execute(
                 """
@@ -44,4 +46,14 @@ def overview():
                 """
             ).fetchall()
         )
-        return {"分布": counts, "在途": active, "环境版本": versions, "实例": health}
+        return {
+            "分布": counts,
+            "在途": active,
+            "环境版本": versions,
+            "实例": health,
+            # 红入闸在总览必须露出，且与挂接/审计同一口径
+            "入闸一致性": consistency,
+            "红入闸告警数": consistency["红入闸在途"],
+            "绿入闸在途数": consistency["绿入闸在途"],
+            "挂接脏行数": consistency["挂接中脏行"],
+        }

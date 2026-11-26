@@ -5,9 +5,23 @@ from app.db import db, init_db
 from app.services.common import audit, now_str, set_app_env_version, upsert_instance
 
 
+def reconcile_settings(conn) -> None:
+    """全局只贯彻一臂：移除与「红单可告警入闸」矛盾的旧二元开关。"""
+    conn.execute("DELETE FROM settings WHERE key='入闸须流水线绿'")
+    conn.execute(
+        """
+        INSERT INTO settings(key, value) VALUES
+          ('入闸架构臂', '红单可告警入闸'),
+          ('红入闸晋升', '硬阻断，不得按绿通过')
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """
+    )
+
+
 def seed_if_empty() -> None:
     init_db()
     with db() as conn:
+        reconcile_settings(conn)
         n = conn.execute("SELECT COUNT(*) AS c FROM apps").fetchone()["c"]
         if n:
             return
@@ -49,7 +63,6 @@ def seed_if_empty() -> None:
             INSERT INTO settings(key, value) VALUES
               ('允许跳级', '否'),
               ('金丝雀默认比例', '10'),
-              ('入闸须流水线绿', '是'),
               ('维护窗硬拒', '是')
             """
         )
@@ -58,8 +71,9 @@ def seed_if_empty() -> None:
             """
             INSERT INTO releases(
               serial, app_id, target_version, artifact_digest, status, pipeline_status,
+              gate_verdict, gate_pipeline_status, gate_alarm,
               current_env_id, canary_ratio, note, created_at, admitted_at
-            ) VALUES (?, ?, ?, ?, '已入闸', '绿', ?, 10, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, '已入闸', '绿', '绿入闸', '绿', 0, ?, 10, ?, ?, ?)
             """,
             (
                 f"发{datetime.now().strftime('%Y%m%d')}0001",
@@ -73,6 +87,23 @@ def seed_if_empty() -> None:
             ),
         )
         rid = conn.execute("SELECT id FROM releases ORDER BY id DESC LIMIT 1").fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO artifact_links(
+              release_id, artifact_digest, pipeline_status, verdict,
+              link_state, alarm, note, created_at
+            ) VALUES (?, 'sha256:seed-demo-artifact', '绿', '绿入闸',
+                      '挂接成功', 0, '绿入闸：流水线绿，挂接成功', ?)
+            """,
+            (rid, now),
+        )
         upsert_instance(conn, app, envs["测"], "1.3.0", "探针绿", rid)
         set_app_env_version(conn, app, envs["测"], "1.3.0")
+        audit(
+            conn,
+            "发版单",
+            rid,
+            "入闸",
+            "绿入闸｜流水线结论=绿｜挂接行=挂接成功｜红入闸告警=否｜种子初始化",
+        )
         audit(conn, "系统", None, "种子初始化", "发版闸")
